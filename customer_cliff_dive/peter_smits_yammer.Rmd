@@ -1,0 +1,84 @@
+---
+title: 'Yammer data challenge'
+output: 
+html_document:
+    toc: true
+    toc_depth: 2
+---
+
+# Setup
+
+[Illustrating the dip](https://app.mode.com/modeanalytics/reports/cbb8c291ee96/runs/7925c979521e/viz1/cfcdb6b78885)
+
+"You are responsible for determining what caused the dip [in engagement] at the end of the chart shown above and, if appropriate, recommending solutions for the problem."
+
+Yammer defines
+
+
+## Getting oriented
+
+Why is there a drop in engagement?
+
+- Random variation -- some days have higher engagement then others due to the randomness of the sampling/observation process (e.g. regression to the mean).
+- Loss of membership -- fewer members mean lower max engagement. Need to measure engagement relative to membership size.
+- Holiday might affect part of user base (e.g. international event not affecting dev team).
+
+
+# Quicklook results
+
+# Importing and munging
+
+```{r import_package, results = 'hide'}
+if(!('pacman' %in% rownames(installed.packages()))) {
+  install.packages('pacman')
+}
+library(pacman)
+
+p_load(readr, janitor, here)
+p_load(magrittr, dplyr, purrr, ggplot2, forcats, lubridate)
+p_load(knitr, kableExtra)
+p_load(rsample)
+
+set_here()
+```
+
+The Yammer dataset is spread across multiple files, similar to different tables in a database.
+
+```{r import_data}
+users <- read_csv(here::here('data', 'yammer_users.csv'))
+events <- read_csv(here::here('data', 'yammer_events.csv'))
+emails <- read_csv(here::here('data', 'yammer_emails.csv'))
+rollup <- read_csv(here::here('data', 'dimension_rollup_periods.csv'))
+```
+
+"Engagement" type events are what Yammer uses to measure user activity. Some users may never have performed any recorded events, and not all recorded events are considered "engagements."
+
+
+```{r combine_data}
+users_engaged <- 
+  users %>%
+  # only users who have performed events (right join filters)
+  right_join(events, by = 'user_id') %>%
+  # only egagement type events
+  filter(event_type == 'engagement')
+```
+
+
+
+
+# Visualization and exploration
+
+```{r vis_constants}
+theme_set(theme_bw())
+```
+
+
+# Modeling
+
+## Feature engineering
+
+## Train/test split
+
+## Valdiation
+
+# Summary and conclusions
