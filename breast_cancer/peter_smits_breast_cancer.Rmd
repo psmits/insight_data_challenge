@@ -1,0 +1,342 @@
+---
+title: 'Breast Cancer data challenge'
+output: html_document
+---
+
+# Setup: Breast Cancer data challenge
+
+You belong to a data team at a local research hospital. You've been tasked with developing a means to help doctors diagnose breast cancer. You've been given data about biopsied breast cells; where it is benign (not harmful) or malignant (cancerous).
+
+1. What features of a cell are the largest drivers of malignancy?
+2. How would a physician use your product?
+3. There is a non-zero cost in time and money to collect each feature about a given cell. How would you go about determining the most cost-effective method of detecting malignancy?
+
+We want to predict the cancer state using information about the cancerous cells.
+
+# Quicklook results
+
+I've chosen to do this exploration in R because a lot of the tidyverse tools and ggplot2 are well suited for fast EDA. Additionally, libraries such as `brms` are ideal for developing Bayesian statistical models.
+
+I've filtered the data to exclude rows which are missing most of their data, and deduplicated based on observation id-s. I've also fixed a minor coding error that is persistent in the data.
+
+I used Bayesian logistic regession to model malignant versus benign cancerous tissues as predicted by many different measures of the cells in the tissue.
+
+When all the variables are put on the same scale, [clump thickness appears to have the largest effect sizes for predicting if a tissue is a malignant cancer. In contrast, uniformity of cell size, shape, and normal nucleoli appear to have no strong predictive value.](#results)
+
+Additionally, the median posterior probability of the average observation being malignant is approximately 27%.
+
+I chose AUC (area under the receiver operating characteristic curve) as my validation metric because this measure balances the false and true positive rates of the model estimates. This property is useful in the context of cancer diagnoses because we want to correctly identify malignant cases as often as possible without ever getting a false positive diagnoses. The model has a [median posterior **out-of-sample** AUC of 0.923 (0.909--0.930 50% credible interval).](#validate) AUC was chosen as the metric of interest because I want to maximize true positive rate while minimizing false positive rate. This value means that given two random individuals, we would correctly identify which is the malignant and which is benign with probability 0.923.
+
+
+
+# Importing and Munging
+
+The first step is, of course, bringing in the data and getting it ready for analysis. 
+
+```{r, load_stuff}
+library(readr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(janitor)
+library(forcats)
+library(rsample)
+library(brms)
+library(tidybayes)
+library(pROC)
+
+set.seed(420)
+
+# plotting constant
+theme_set(theme_bw())
+
+breast_data <- read_csv('breast-cancer-wisconsin.txt')
+# i like to clean the names immediately
+breast_data <- clean_names(breast_data)
+
+kable(head(breast_data)) %>%
+  kable_styling() %>%
+  scroll_box(height = '100%', width = '100%')
+```
+
+Let's look for missing data. Are these values concentrated (whole rows) or are they randomly distributed in the data?
+
+```{r, check_na}
+breast_data %>%
+  filter_all(.vars_predicate = any_vars(is.na(.))) %>%
+  head(.) %>%
+  kable(.) %>%
+  kable_styling() %>%
+  scroll_box(height = '100%', width = '100%')
+```
+
+Ok, all of these NAs are all in the same rows. This makes them surprisingly unhelpful. So let's remove rows with NAs.
+
+```{r, remove_na}
+breast_data <- 
+  breast_data %>%
+  drop_na()
+```
+
+Something weird that I noticed looking at the column types was that many of the columns are imported as character, not numeric. But all of the columns should have numeric values. I need to find these non-numeric values and figure out if they are encoding useful information of if they are just alternative ways of writing `NA`.
+
+```{r, check_numeric}
+breast_data %>%
+  filter(str_detect(uniformity_of_cell_size, pattern = '[:alpha:]')) %>%
+  head(.) %>%
+  kable(.) %>%
+  kable_styling() %>%
+  scroll_box(height = '100%', width = '100%')
+```
+
+These non-numeric values all appear to be codes for missing data that aren't NAs. These missing values are also for an entire observation, not just a single value for that individual. These values seem appropriate to remove. To do this, I'm going to coerce every column to be numeric and drop the NAs that are created. The warnings that are created by this coercion are suppressed.
+
+```{r, keep_numeric, warning=FALSE}
+breast_data <- 
+  breast_data %>%
+  mutate_all(~ as.numeric(.)) %>%
+  drop_na()
+```
+
+Now all the data is numeric.
+
+We know that are variables (except index, ID, and class) vary between 1 and 10. Let's make sure that's the case. 
+
+```{r, check_range}
+breast_data %>%
+  dplyr::select(-index, -id, -class) %>%
+  summarize_all(list(~ max(.), ~ min(.))) %>%
+  kable(.) %>%
+  kable_styling() %>%
+  scroll_box(height = '100%', width = '100%')
+```
+
+Ok, so we have no accidentally negative values, but we have some values that are off by an order of magnitude. Values of 10 acceptable, but values like 20 or 100 are not. I'm going to assume these are miscoded and include 1 extra 0 at the end. To undo this, I'm going to divide any values greater than 10 by 10.
+
+```{r, fix_magnitude}
+# a function to decrease numeric values by 1 order of magnitude 
+# if they are greater than 10
+dec_mag <- function(x) {
+  target = x > 10
+  x[target] = x[target] / 10
+  x
+}
+
+breast_data  <- 
+  breast_data %>%
+  mutate_all(~ dec_mag(.))
+```
+
+Finally, let's check for duplicate rows. Each person is represented by an id number. I'm going assume that they should only appear once, thus there should only be unique id numbers. I'll just force that.
+
+```{r, dedupe}
+# before
+print(dim(breast_data))
+
+breast_data <- 
+  breast_data %>%
+  distinct(id, .keep_all = TRUE)
+
+# after
+print(dim(breast_data))
+```
+
+WOW! That really shrunk the data.
+
+
+
+
+# Visualizing
+
+First, I want to check how balanced our cancer diagnoses are; do we have an excess number of malignant or benign values.
+
+```{r, vis_response}
+breast_data %>%
+  mutate(class = case_when(class == 4 ~ 'malignant',
+                           class == 2 ~ 'benign')) %>%
+  ggplot(aes(x = class)) +
+  geom_bar(stat = 'count')
+```
+
+Ok, so our classes are fairly balanced. That will help down the line.
+
+
+
+# Modeling
+
+## Feature engineering
+
+Parameter interpretability is enhanced when the predictors all have mean 0. This means the intercept is the expected values of the response variable when all predictors equal 0. I'm also rescaling the data to have standard deviation 1 so that regression coefficients are on the same scale which increases interpretability (and helps with prior selection).
+
+```{r}
+breast_data <- 
+  breast_data %>%
+  mutate_at(.vars = vars(-id, -index, -class),
+            .funs = list(~ (. - mean(.) / sd(.) ))) %>%
+  mutate(class = case_when(class == 4 ~ 1,
+                           class == 2 ~ 0))
+```
+
+
+
+## Train/Test split
+
+Before I fit a model, however, I'm going to divide my data into a training and testing datasets. This way we can see how well our model does in future data. I'm going with a fairly standard 80/20 split stratified on the response variable.
+
+```{r, train_test, cache=TRUE}
+set.seed(420)
+breast_split <- 
+  breast_data %>%
+  initial_split(prop = 0.8, strata = class)
+
+breast_train <- training(breast_split)
+breast_test <- testing(breast_split)
+```
+
+
+## Actually Fit a Model {#results}
+
+With binary data, the most straight forward model is logistic regression. I'm going to fit a Bayesian model for a couple reasons: easier to interpret parameter estimates (which variables matter) and regularization afforded by the prior.
+
+Of course, being a Bayesian model I need to pick appropriate priors. In logistic regression, the intercept term is very unlikely to be greater than 2.5 or less than -2.5. Additionally, for data with mean 0 and standard deviation 1, effects are rarely going to be getter than 1 or less than -1. This gives some useful default priors. By concentrating so much of the density around 0, I'm regularizing the parameter estimates so that they don't go wild spuriously. I'm not going to use very strong priors, but enough that represents this domain expertise without overly biasing our estimates. In particular, I'm assigning the intercept a wider prior.
+
+I'm using all variables (except id and index) as predictors in my model.
+
+```{r, fit_model, cache=TRUE}
+breast_model <- 
+  breast_train %>%
+  dplyr::select(-id, -index) %>%
+  brm(data = .,
+      family = 'bernoulli',
+      formula = bf(class ~ .),
+      prior = c(prior(normal(0, 5), class = 'Intercept'),
+                prior(normal(0, 1), class = 'b')),
+      iter = 2000,
+      warmup = 1000,
+      chains = 4,
+      cores = 4,
+      refresh = 0)
+```
+
+Quick model summary to make sure our chains converged. If there were any warning signs here, we could go deeper and diagnose those problems. But we don't have to.
+```{r, model_summary}
+summary(breast_model)
+```
+
+Plotting the regression coefficients.
+```{r, reg_coef}
+breast_model %>%
+ tidy_draws()  %>%
+ dplyr::select(-(.chain:.draw), -(lp__:energy__)) %>%
+ gather(key = key, value = value) %>%
+ mutate(key = fct_inorder(key),
+        key = fct_rev(key)) %>%
+ ggplot(aes(x = value, y = key)) +
+ geom_halfeyeh(.width = c(0.9, 0.5)) + # alternative to ggridges
+ labs(x = 'Posterior estimate', y = 'Regression coefficient')
+```
+
+Clump thickness appears to have the largest effect sizes for predicting if a tissue is a malignant cancer. In contrast, uniformity of cell size, shape, and normal nucleoli appear to have no strong predictive value.
+
+
+
+## Validation {#validate}
+
+How do we know this is a good model? Are we predicting cancer well without getting a lot of false positives? We want to maximize the number of true positives while minimizing the number of false positives. This sounds like a job for the receiver operating characteristic (ROC), specifically the area under that curve (AUC).
+
+I'm going to do validation in two substeps.
+
+
+### Posterior predictive analysis
+
+Posterior predictive analysis is when we compare estimates of our training data to our training data. This is a basic task for determining how well our model represents our data. If we aren't representing our training data, what hope do we have to predict our testing data?
+
+This is a quick visual of our confusion matrix. When values are in the top right or the bottom left, we're doing good.
+```{r, cmat_train, cache=TRUE}
+set.seed(420)
+breast_train %>%
+  add_predicted_draws(model = breast_model, n = 100) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_jitter(aes(x = .prediction, y = class), alpha = 0.1) +
+  labs(x = 'Predicted cancer state', y = 'Observed cancer state')
+```
+
+Let's calculate a posterior distribution of AUC values.
+```{r, train_auc, cache=TRUE, warning=FALSE}
+set.seed(420)
+breast_train %>%
+  add_predicted_draws(model = breast_model, n = 100) %>%
+  ungroup() %>%
+  group_by(.draw) %>%
+  transmute(auc = auc(response = class,
+                      predictor = .prediction,
+                      quiet = TRUE)) %>%
+  ggplot(aes(x = auc)) +
+  geom_histogram()
+```
+
+
+### Testing data
+We do a very good job with the training data. But what about the testing data? This is a measure of how well we do when looking at new data.
+
+
+This is a quick visual of our confusion matrix. When values are in the top right or the bottom left, we're doing good.
+```{r, cmat_test, cache=TRUE}
+set.seed(420)
+breast_test %>%
+  add_predicted_draws(model = breast_model, n = 100) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_jitter(aes(x = .prediction, y = class), alpha = 0.2) +
+  labs(x = 'Predicted cancer state', y = 'Observed cancer state')
+```
+
+Let's calculate a posterior distribution of AUC values.
+```{r, test_auc, cache=TRUE, warning=FALSE}
+set.seed(420)
+test_auc <- 
+  breast_test %>%
+  add_predicted_draws(model = breast_model, n = 100) %>%
+  ungroup() %>%
+  group_by(.draw) %>%
+  transmute(auc = auc(response = class,
+                      predictor = .prediction,
+                      quiet = TRUE)) %>%
+  ungroup()
+
+# 50% ci on AUC, along with median
+test_auc %>%
+  dplyr::summarize(q25 = quantile(auc, 0.25),
+                   q50 = quantile(auc, 0.5),
+                   q75 = quantile(auc, 0.75))
+
+test_auc %>%
+  ggplot(aes(x = auc)) +
+  geom_histogram()
+
+```
+
+We even do a really good job on the training data.
+
+
+# Summary
+
+I've chosen to do this exploration in R because a lot of the tidyverse tools and ggplot2 are well suited for fast EDA. Additionally, libraries such as `brms` are ideal for developing Bayesian statistical models.
+
+I've filtered the data to exclude rows which are missing most of their data, and deduplicated based on observation id-s. I've also fixed a minor coding error that is persistent in the data.
+
+I used Bayesian logistic regession to model malignant versus benign cancerous tissues as predicted by many different measures of the cells in the tissue.
+
+When all the variables are put on the same scale, [clump thickness appears to have the largest effect sizes for predicting if a tissue is a malignant cancer. In contrast, uniformity of cell size, shape, and normal nucleoli appear to have no strong predictive value.](#results)
+
+Additionally, the median posterior probability of the average observation being malignant is approximately 27%.
+
+I chose AUC (area under the receiver operating characteristic curve) as my validation metric because this measure balances the false and true positive rates of the model estimates. This property is useful in the context of cancer diagnoses because we want to correctly identify malignant cases as often as possible without ever getting a false positive diagnoses. The model has a [median posterior **out-of-sample** AUC of 0.923 (0.909--0.930 50% credible interval).](#validate) AUC was chosen as the metric of interest because I want to maximize true positive rate while minimizing false positive rate. This value means that given two random individuals, we would correctly identify which is the malignant and which is benign with probability 0.923.
+
+Future improvements might consider interactions between the predictors as well as the possibililty of non-linear effects. For example, do the size and shape of the cells have an interaction where their combination is more informative then them individually? Additionally, a generalized additive model would allow for many of the same easy to understand insights that we see in this analysis while allowing for non-linear relations.
