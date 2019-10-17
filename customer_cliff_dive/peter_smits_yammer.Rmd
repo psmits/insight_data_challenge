@@ -1,9 +1,9 @@
 ---
 title: 'Yammer data challenge'
 output: 
-html_document:
+  html_document:
     toc: true
-    toc_depth: 2
+    toc_float: true
 ---
 
 # Setup
@@ -12,7 +12,6 @@ html_document:
 
 "You are responsible for determining what caused the dip [in engagement] at the end of the chart shown above and, if appropriate, recommending solutions for the problem."
 
-Yammer defines
 
 
 ## Getting oriented
@@ -20,65 +19,403 @@ Yammer defines
 Why is there a drop in engagement?
 
 - Random variation -- some days have higher engagement then others due to the randomness of the sampling/observation process (e.g. regression to the mean).
+  - look at first differences.
+  - fit time series model to data before "dip" starts. compare forecasts with "dip."
+- Binning artifact -- edge effects created in the binning process. A weird example would be the final week only having 2 days compared to all the others at 7.
+  - edge effects related to this
+  - are some days more popular than others?
 - Loss of membership -- fewer members mean lower max engagement. Need to measure engagement relative to membership size.
-- Holiday might affect part of user base (e.g. international event not affecting dev team).
+- Holiday might affect part of user base (e.g. international event not affecting local team).
+
+
+I'm going to do this analysis using R and RMarkdown because the output format is quiet elegant. Also, the combination of `dplyr`/`tidyverse` tools with `tsibble`, `fable`, and `feasts` makes working with time series data easy.
 
 
 # Quicklook results
 
-# Importing and munging
 
-```{r import_package, results = 'hide'}
+- My initial assesement is that engagement is acting as a random walk with a strong weekly cycle.
+- This means which means that an increase or decrease in egagement are both equally likely.
+- Comparing differences over weekly cycles reveals a possible change in user engagement that took place in early August.
+- I fit an (auto) ARIMA model to the time series of engagement before August. 
+- When this fitted model forecasts relative user engagement for August, a discrepency is identified, where user engagement appears to actually be lower than we'd expect from previous months.
+- This discrepency appears *during the week* but not the weekends.
+
+
+
+
+# Import packages and data
+
+```{r package_import, results = 'hide'}
+# this way of loading packages ensures all are installed and up-to-date
 if(!('pacman' %in% rownames(installed.packages()))) {
   install.packages('pacman')
 }
 library(pacman)
 
 p_load(readr, janitor, here)
-p_load(magrittr, dplyr, purrr, ggplot2, forcats, lubridate)
+p_load(magrittr, dplyr, tidyr, lubridate, forcats)
+p_load(ggplot2)
 p_load(knitr, kableExtra)
-p_load(rsample)
+p_load(forecast, tsibble, fable, feasts, urca)
 
-set_here()
+# file path relativizer
+if(!file.exists('.here')) {
+     set_here()
+}
 ```
 
 The Yammer dataset is spread across multiple files, similar to different tables in a database.
 
-```{r import_data}
-users <- read_csv(here::here('data', 'yammer_users.csv'))
-events <- read_csv(here::here('data', 'yammer_events.csv'))
-emails <- read_csv(here::here('data', 'yammer_emails.csv'))
-rollup <- read_csv(here::here('data', 'dimension_rollup_periods.csv'))
+```{r data_import}
+users <- read_csv(here::here('data', 'yammer_users.csv')) %>% clean_names(.)
+events <- read_csv(here::here('data', 'yammer_events.csv')) %>% clean_names(.)
+emails <- read_csv(here::here('data', 'yammer_emails.csv')) %>% clean_names(.)
+rollup <- read_csv(here::here('data', 'dimension_rollup_periods.csv')) %>% 
+  clean_names(.)
 ```
 
-"Engagement" type events are what Yammer uses to measure user activity. Some users may never have performed any recorded events, and not all recorded events are considered "engagements."
+"Engagement" type events are what Yammer uses to measure user activity. Some users may never have performed any recorded events, and not all recorded events are considered "engagements." I'm going to hold off filtering to just "engagement" type activities till I specifically need that information. There might be important information in the non-engagement type activities.
 
+Yammer used week-long periods in their dashboard that identified the dip in engagement. There are lots of different periods identified in the `rollup` table. The one that relates to weeks is `period_id == 1007`. So, I'm going to define a filtered table with the week-long periods. This will help with diagnosing if there are anything unique to this window-ing scheme.
 
-```{r combine_data}
-users_engaged <- 
-  users %>%
-  # only users who have performed events (right join filters)
-  right_join(events, by = 'user_id') %>%
-  # only egagement type events
-  filter(event_type == 'engagement')
+```{r period_week}
+rollup_week <- 
+  rollup %>%
+  filter(period_id == 1007)
 ```
 
+I'll probably not end up needing this, but the idea that they use weeklong rolling averages to measure engagement is probably important.
 
 
-
-# Visualization and exploration
+# Exploration 
 
 ```{r vis_constants}
 theme_set(theme_bw())
 ```
 
+Yammer measures engagement as total number of users who performed at least one engagement type activity. Let's count active users over time, starting with days. 
 
-# Modeling
+```{r active_day}
+engage_day <- 
+  events %>%
+  filter(event_type == 'engagement') %>%
+  mutate(date_day = date(occurred_at)) %>%
+  group_by(date_day) %>% 
+  summarize(n_engage = n_distinct(user_id))
 
-## Feature engineering
+engage_day %>%
+  ggplot(aes(x = date_day, y = n_engage)) + 
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Engagement',
+       title = 'Engagement over time')
+```
 
-## Train/test split
+That looks like weekly periodicity -- you can clearly see weekends. Interestingly, Yammer measures engagement in weekly windows -- the cycles are probably distracting.
 
-## Valdiation
+
+What happens when I plot engagement as "relative engagement", or engagement divided by the number of unique users who existed during that day.
+
+First, we have to find the activation date for every user. The cumulative sum of number of user activations, ordered in time, is the growth of the user base of time. This measure can only increase because we do not have "deactivation" date information -- we'd have to infer that.
+
+```{r users_active}
+users_active <- 
+  users %>%
+  drop_na() %>%
+  dplyr::select(activated_at, state) %>%
+  mutate(activated_date = date(activated_at)) %>%
+  group_by(activated_date) %>%
+  summarize(n_user = n()) %>%
+  arrange(activated_date) %>%
+  mutate(user_base = cumsum(n_user))
+```
+
+Let's plot both the number of activations per day and the total number of activations over time ("total user base size").
+
+```{r users_active_plot}
+
+users_active %>%
+  pivot_longer(-activated_date) %>%
+  mutate(name_clean = case_when(name == 'n_user' ~ 'User activations',
+                                name == 'user_base' ~ 'Total activations'),
+         name_clean = fct_relevel(name_clean, 'User activations')) %>%
+  ggplot(aes(x = activated_date, y = value)) +
+  geom_line() +
+  facet_grid(name_clean ~ ., scales = 'free_y') +
+  labs(x = 'Date',
+       y = 'Active users',
+       title = 'User activation over time')
+```
+
+The number of activations per day, on average, increases with time. However, the variance in activations per day also appears to increase with time.
+
+By design, the total user base measure never decreases. Usefully, there do not appear to be any plateaus or spikes in this time series. 
+
+If it isn't obvious, activations over time is the first differences of total activations over time.
+
+Now that I've briefly inspected user activations and user activations over time, let's look at engagement relative to user base size. Ideally, relative engagement should remain constant over time -- all users are engaging at an equal rate. 
+
+```{r active_rel}
+engage_day_relative <- 
+  engage_day %>%
+  left_join(users_active, by = c('date_day' = 'activated_date')) %>%
+  mutate(engage_relative = n_engage / user_base)
+
+
+engage_day_relative %>%
+  ggplot(aes(x = date_day, y = engage_relative)) +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Relative engagement (engagement / # active users',
+       title = 'Relative engagement over time')
+```
+
+This new graph of relative engagement appears to tell a much more interesting story about engagement. As the user base increases (see earlier graph), relative engagement appears to decrease. But can we believe this trend? Or are our eyes deceived by a random walk?
+
+
+
+A big unanswer question about this data is if the time series is behaving as a random walk, which would mean increases or decreases in our metric are equally likely. If this is the case, then a dip in our metric is to be expected. What matters is if this dip turns into a trend -- something that happens only if it *keeps* decreasing.
+
+
+There are a strategies we can take here, for both engagement and relative engagement:
+
+1. Investigate if the time series is indistinguishable from a random walk.
+2. Fit a time series model to part of the data before the "dip" and see if the dip falls within the confidence interval of our forecasts.
+
+Something that must also be considered is the **weekly** change in engagement. For example, how have Mondays changed over time?
+
+
+# Random walk?
+
+
+## Engagement
+
+### Daily
+
+I'm going to start by investigating if the daily engagement measure is a random walk. This is *not* relative engagement.
+
+```{r diff_daily, warning=FALSE}
+engage_day %<>%
+  mutate(n_diff = difference(n_engage, 1))
+
+engage_day %>%
+  ggplot(aes(x = date_day, 
+             y = n_diff)) +
+  geom_hline(yintercept = 0, 
+             size = 1.5, 
+             linetype = 'dashed') +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Change in engagement',
+       title = 'First differences of user engagement')
+```
+
+There is most definitely a periodicity to this data. Additionally, there probably isn't any underlying trend in the data beyond this periodicity -- the differences of the engagement time series are highly cyclical. Also, the mean of the differences appears to be very close to 0.
+
+I'm going to plot the distribution of the daily differences in user engagement. If necessary, we can do a formal test of if the mean of the differences are indistinguishable from 0.
+
+```{r diff_daily_dist, warning=FALSE}
+engage_day %>%
+  ggplot(aes(x = n_diff)) +
+  geom_vline(xintercept = 0, 
+             size = 1.5, 
+             linetype = 'dashed') +
+  geom_density(fill = 'lightgrey', alpha = 0.5) +
+  labs(x = 'Change in daily engagement',
+       title = 'Distribution of daily changes in user engagement')
+```
+
+The distribution of the first differences of daily engagement is centered around 0, but has very heavy tails with two local modes at each extreme. These relative peaks are probably caused by the weekly cycles in the data.
+
+
+### Weekly 
+
+Given that the weekly cycles seem to be *extremely* important to this time series, let's look at the 7 day differences for engagement.
+
+```{r diff_weekly, warning=FALSE}
+engage_day %<>%
+  mutate(week_diff = difference(n_engage, 7))
+
+engage_day %>%
+  ggplot(aes(x = date_day,
+             y = week_diff)) +
+  geom_hline(yintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_line() +
+  labs(x = 'Date',
+       y = 'Change in weekly engagement',
+       title = 'Weekly difference in user engagement')
+```
+
+WOAH. Something appears to have happened to raw enagement in early August, though things appear to be back to normal by the end of August. I wonder if that carries over to relative engagement?
+
+Just to be certain, let's look at the distribution of the 7 day differences to see if they have a weird shape.
+
+```{r diff_weekly_dist, warning=FALSE}
+engage_day %>%
+  ggplot(aes(x = week_diff)) +
+  geom_vline(xintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_density(fill = 'lightgrey', 
+               alpha = 0.5) +
+  labs(x = 'Change in weekly engagement',
+       title = 'Distribution of weekly changes in engagement')
+```
+
+Interesting. Our differences are still consistent with a random walk. The anomaly in the time series may just be a normal part of a random walk.
+
+
+
+
+
+## Relative engagement
+
+### Daily
+
+If we consider relative engagement, does our understanding of daily changes in engagement change? 
+
+```{r diff_daily_relative, warning=FALSE}
+engage_day_relative %<>%
+  mutate(n_diff = difference(engage_relative, 1))
+
+engage_day_relative %>%
+  ggplot(aes(x = date_day,
+             y = n_diff)) +
+  geom_hline(yintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_line() + 
+  labs(x = 'Date',
+       y = 'Change in relative engagement',
+       title = 'Change in relative daily engagement over time')
+
+```
+
+This appears to share a lot of features with the previous differences plot, with one potential subtlety -- the variance might be decreasing with time.
+
+Again, let's plot the distribution of the differences.
+
+```{r diff_daily_relative_dist, warning=FALSE}
+engage_day_relative %>%
+  ggplot(aes(x = n_diff)) +
+  geom_vline(xintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_density(fill = 'lightgrey', 
+               alpha = 0.5) +
+  labs(x = 'Change in relative engagement',
+       title = 'Distribution of daily changes in relative engagement')
+```
+
+Similar situation -- two relative modes in the tails, again probably caused by the weekly cycles.
+
+
+### Weekly 
+
+At this point, it is obvious that the weekly cycles are *fundamental* to this data. So, let's see how relative engagement has changed at weekly scales.
+
+```{r diff_relative_week}
+engage_day_relative %<>%
+  mutate(week_diff = difference(engage_relative, 7))
+
+engage_day_relative %>%
+  ggplot(aes(x = date_day,
+             y = week_diff)) +
+  geom_hline(yintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_line() +
+  labs(x = 'Change in relative weekly engagement',
+       title = 'Change in relative weekly engagement over time')
+```
+
+Ok, more evidence that user activity may have changed in early August.
+
+I'm still concerned about the possibility that this time series is just a random walk. There can be apparent "trends" or anomalies in a random walk that have no actual meaning.
+
+```{r diff_relative_week_dist, warning=FALSE}
+engage_day_relative %>%
+  ggplot(aes(x = week_diff)) +
+  geom_vline(xintercept = 0,
+             size = 1.5,
+             linetype = 'dashed') +
+  geom_density(fill = 'lightgrey',
+               alpha = 0.5) +
+  labs(x = 'Change in relative weekly engagement',
+       title = 'Distribution of weekly changes in relative engagement')
+```
+
+Ok, still can't fully rule out we are looking at a random walk.
+
+
+# But is August different?
+
+I still can't rule out of the time series is just a random walk or if there is actually something interesting with user enagement in August. My strategy for answering this question is to fit a model to all the data before August, and use that model to forecast August for forward. If our observed engagement values for August are consistent with my forecasts, then we can't conclude that the dip in user engagement in August is "important".
+
+At this point we have to figure out if enagement August is behaving differently from previous engagement. This means splitting out data at August 1st (2014-08-01).
+
+```{r split_august}
+cut_point <- ymd(20140801)
+
+before_august <- 
+  engage_day_relative %>%
+  filter(date_day < cut_point) %>%
+  as_tsibble(index = date_day)
+
+after_august <- 
+  engage_day_relative %>%
+  filter(date_day >= cut_point) %>%
+  as_tsibble(index = date_day)
+
+```
+
+If you can't already tell, the `before_august` table is our training data and the `after_august` table is our testing data.
+
+
+```{r arima_train}
+model_fit <- 
+  before_august %>%
+  model(auto_arima = ARIMA(engage_relative))
+
+tidy(model_fit)
+```
+
+So the data before August appears to have a weekly component (guessed that) and a drift component. This drift appears to be negative.
+
+Let's forecast relative engagement for August.
+
+```{r arima_test, warning=FALSE, message=FALSE}
+model_forecast <- 
+  model_fit %>%
+  fabletools::forecast(new_data = after_august)
+
+after_august %>%
+  dplyr::select(engage_relative) %>%
+  fabletools::autoplot(colour = 'red') +
+  fabletools::autolayer(before_august %>% 
+                        dplyr::select(engage_relative)) +
+  fabletools::autolayer(model_forecast, alpha = 0.5) +
+  ggtitle('Forecasted vs. observed relative engagement for august') +
+  xlab('Date') +
+  ylab('Relative engagement')
+```
+
+Aha! There is a discrpency between our observed and predicted values for November. It appears the drop in engagement in August is more than we'd expect given our earlier information.
+
+
+
+
 
 # Summary and conclusions
+
+- My initial assesement is that engagement is acting as a random walk with a strong weekly cycle.
+- This means which means that an increase or decrease in egagement are both equally likely.
+- Comparing differences over weekly cycles reveals a possible change in user engagement that took place in early August.
+- I fit an (auto) ARIMA model to the time series of engagement before August. 
+- When this fitted model forecasts relative user engagement for August, a discrepency is identified, where user engagement appears to actually be lower than we'd expect from previous months.
+- This discrepency appears *during the week* but not the weekends.
+- The next step would be to dive into user activies that occurrend during the end July and for all of August. Are new users not engaging with the platform?
+  - How has weekday activity changed?
