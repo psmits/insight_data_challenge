@@ -1,0 +1,181 @@
+---
+title: 'Costly conversion data challenge'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 120)
+```
+
+
+# Setup
+
+The goal here is to evaluate whether a pricing test running on the site has been successful. As always, you should focus on user segmentation and provide insights about segments who behave differently as well as any other insights you might find.
+
+# Quicklook results
+
+
+
+
+# Import and inspect
+
+The first step is importing the data 
+
+
+```{r import_package, results = 'hide', message = FALSE}
+if(!('pacman' %in% rownames(installed.packages()))) {
+  install.packages('pacman')
+}
+library(pacman)
+
+p_load(readr, janitor, here)
+p_load(magrittr, dplyr, tidyr, lubridate, stringr, broom)
+p_load(ggplot2, scales)
+p_load(knitr, kableExtra, skimr, pander)
+
+if(!file.exists('.here')) {
+  set_here(path = getwd())
+}
+
+# summary constants
+skim_with_defaults()
+
+# plotting constants
+theme_set(theme_bw())
+```
+
+```{r import_data, message = FALSE}
+user_info <- read_csv(here::here('user_table.csv')) %>% clean_names(.)
+test_results <- read.csv(here::here('test_results.csv')) %>%
+  as_tibble(.) %>%
+  clean_names(.) %>%
+  mutate(timestamp = as.character(timestamp),
+         datetime = parse_datetime(timestamp))
+```
+
+On initial import of the data, `read_csv()` returned a bunch of warnings regarding the `timestamp` column.
+Something hilarious that I found in the data is that over 5000 of the entries have an invalid datetime in the timestamp column. In all of these cases, as displayed by the warnings, the event occurs in minute 60. And that's impossible, even with leap seconds.
+
+There are two ways of handling these improperly formatted: ignoring them, or assume that the datetime counter failed to roll over. The former is much easier than the latter. Ignoring these entries, however, might have downstream problems -- especially if they are biased in one direction (e.g. all from the experimental group).
+
+
+## Summary table
+
+But first, let's quickly inspect the entire dateset to get an idea of missing data and distributions.
+
+```{r inspect_quick, results = 'asis'}
+skim(test_results) %>% 
+  pander()
+```
+
+Turns out there isn't any missing data, except that introduced creating the `datetime` column.
+
+Let's visualize if the invalid date times in the `timestamp` column are associated with one of the experimental classes for than the other.
+
+```{r vis_missing}
+missing_results <- 
+  test_results %>%
+  dplyr::select(datetime, test, converted) %>%
+  filter(is.na(datetime)) %>%
+  mutate(test_name = case_when(test == 0 ~ 'Control',
+                               test == 1 ~ 'Test'),
+         converted_name = case_when(converted == 1 ~ 'Bought',
+                                    converted == 0 ~ 'Did not buy'))
+
+missing_results %>%
+  ggplot(aes(x = factor(test_name))) +
+  geom_bar() +
+  labs(x = 'Experimental Group',
+       y = 'Count',
+       title = 'Distribution of malformed timestamps by experimental group')
+```
+
+Given that we know two-thirds of our data is from the Control group and one-third of our data is from the Test group, the above graph appears to indicate that these malformed timestamps are randomly distributed wrt the experiment. 
+
+But are these malformed dates structured by if the user "converted" or not?
+
+```{r vis_missing_2}
+missing_results %>%
+  ggplot(aes(x = factor(converted_name))) +
+  geom_bar() +
+  labs(x = 'Conversion state',
+       y = 'Count',
+       title = 'Distribution of malformed timestamps by conversion state')
+```
+
+Most of our malformed timestamps are from users that did not end up buying the product. Would we expect that given the distribution of conversions?
+
+```{r vis_conversion}
+test_results %>%
+  mutate(converted_name = case_when(converted == 1 ~ 'Bought',
+                                    converted == 0 ~ 'Did not buy')) %>%
+  ggplot(aes(x = converted_name)) +
+  geom_bar() +
+  labs(x = 'Conversion state',
+       y = 'Count',
+       title = 'Count of converted vs not converted users (all data)')
+```
+
+Probably. So there is probably not immediate cause for concern.
+
+
+
+# Looking at experimental results
+
+## Basic comparison
+
+We want to know if the test group has a greater conversion rate than the control group. Our response is the `converted` column. We can explore conversion as predicted by test by building a two-way table. In this case, we do not need to drop the observations with missing timestamps.
+
+```{r conversion_table}
+conversion_table <- 
+  test_results %>%
+  dplyr::select(test, converted) %>%
+  transmute(Experiment = case_when(test == 1 ~ 'Test',
+                                   test == 0 ~ 'Control'),
+            Result = case_when(converted == 1 ~ 'Bought',
+                               converted == 0 ~ 'Did not buy')) %>%
+  tabyl(Experiment, Result) 
+
+conversion_table %>%
+  adorn_totals(c('row', 'col')) %>%
+  adorn_percentages('row') %>%
+  adorn_pct_formatting(rounding = "half up", digits = 2) %>%
+  adorn_ns() %>%
+  adorn_title('Conversion results for experiment (all data)',
+              placement = 'top') %>%
+  knitr::kable() %>%
+  kableExtra::kable_styling()
+
+conversion_table %>%
+  chisq.test() %>%
+  tidy()
+```
+
+
+A $\chi^{2}$ test (displayed) might be the appropriate here: we are testing to see if there is a significant difference between the expected frequencies and the observed frequencies in the two-way table. Given this, we might say that the test group is converting at a lower rate than the control group. However, this test doesn't deal with differences in revenue created by the new group or if there is an increase or decrease in conversion based on the testing group.
+
+Regardless, the results of the $\chi^{2}$ test indicate that there is a significant difference between the test and control groups. Based on the distribution of counts in the two-way table, a smaller percentage of the test group is converting than the control group.
+
+But is that meaningful for our question? What about revenue? What about different segments of the user base? Currently, I've only considered the user base as a whole.
+
+
+## Revenue comparison
+
+What probably matters more is the "bottom line", or revenue, associated with the change. Is the gain in revenue enough to overcome the (slight) decrease in conversion rate? I'm still only considering the entire user base.
+
+```{r revenue}
+test_results %>%
+  dplyr::select(user_id, test, converted, price) %>%
+  filter(converted == 1) %>%
+  group_by(test) %>%
+  summarize(earn = sum(price),
+            size = n())
+
+```
+
+
+
+
+## By segment
