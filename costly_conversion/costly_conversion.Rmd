@@ -34,6 +34,8 @@ p_load(readr, janitor, here)
 p_load(magrittr, dplyr, tidyr, lubridate, stringr, broom)
 p_load(ggplot2, scales)
 p_load(knitr, kableExtra, skimr, pander)
+p_load(rstan, brms, tidybayes)
+p_load(parallel, future)
 
 if(!file.exists('.here')) {
   set_here(path = getwd())
@@ -44,6 +46,9 @@ skim_with_defaults()
 
 # plotting constants
 theme_set(theme_bw())
+
+# parallel processing w/ future
+future::plan(multiprocess)
 ```
 
 ```{r import_data, message = FALSE}
@@ -161,21 +166,56 @@ Regardless, the results of the $\chi^{2}$ test indicate that there is a signific
 But is that meaningful for our question? What about revenue? What about different segments of the user base? Currently, I've only considered the user base as a whole.
 
 
-## Revenue comparison
 
-What probably matters more is the "bottom line", or revenue, associated with the change. Is the gain in revenue enough to overcome the (slight) decrease in conversion rate? I'm still only considering the entire user base.
+## By segment
 
-```{r revenue}
+Let's see if there is a particular demographic that is most affected by the A/B test. For example, do mobile users convert at a greater rate than web users? I'm going to use device and source as additional predictors. 
+
+Before I can use source as a predictor, I'm going to simplify the space a little -- I'm just going to compare e.g. ads versus seo and assume that the type of source is mostly noise.
+
+```{r feature_source}
 test_results %>%
-  dplyr::select(user_id, test, converted, price) %>%
-  filter(converted == 1) %>%
-  group_by(test) %>%
-  summarize(earn = sum(price),
-            size = n())
-
+  mutate(source = str_replace(source, '-', '_'),
+         source_simple = str_extract(source, pattern = '^[^_]+(?=_)'))
 ```
 
 
+I'm going to model this data using logistic regression with a series of categorical predictors. In particular, I'm using Bayesian logistic regression to so I can use weakly informative to lightly regularize the regression coefficient estimates. Additionally, by using `brms` I can extract the underlying Stan code, which can be compiled into a C++ module or even used in other programming languages like python. This means my exploration can lead directly to production.
+
+With unbalanced classes, logistic regression can have trouble as the intercept goes to far negative or positive. However, these classes are not severely unbalanced, so I'm going to start this analysis without any special handling of unbalanced classes.
+
+With any Bayesian model, there are always questions surrounding choice of prior. I'm opting for weakly informative priors that are informed by the properties of the logistic function. Coefficients with magnitude greater than 2 are unlikely, and an intercept with magnitude greater than 5 are extremely unlikely. However, I'm going to use a slighly weaker prior for the intercept because it can be hard to predict its behaviour in the presence of predictors. Additionally, by lightly concentrating the density of the prior around 0, high magnitude posterior estimates will be slightly shrunk towards 0. I do not have any more domain knowledge about the problem, so I'm sticking with these rather general priors.
+
+I do not need to explicitly dummy code out the categorical variables as R and `brms` take care of that under the hood.
+
+```{r conversion_model, cache = TRUE, message = FALSE}
+model_1 <- 
+  test_results %>%
+  brm(data = .,
+      family = bernoulli(),
+      formula = bf(converted ~ test + device + source_simple),
+      prior = c(prior(normal(0, 5), class = 'Intercept'),
+                prior(normal(0, 1), class = 'b')),
+      iter = 2000,
+      warmup = 1000,
+      chains = 4,
+      refresh = 0,
+      future = TRUE)                   # parallel processing via future
+```
+```{r conversion_model_summary}
+summary(model_1)
+```
+
+As we learned earlier, the test group has a lower probability of converting than the control group. My guess is that the increased price turns people off.
+
+Additionally, the device has no effect on conversion probability.
 
 
-## By segment
+All of this, however, still hasn't answered the question of how **revenue** may have changed in the test group versus the control.
+
+
+
+I could imagine also using some kind of log-linear model, but that just feels like a special case of logistic regression without all the nice properties afforded by the Bayesian approach.
+
+
+# Conversions over time

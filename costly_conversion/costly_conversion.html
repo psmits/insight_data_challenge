@@ -1520,6 +1520,9 @@ div.tocify {
 <h1>Setup</h1>
 <p>The goal here is to evaluate whether a pricing test running on the site has been successful. As always, you should focus on user segmentation and provide insights about segments who behave differently as well as any other insights you might find.</p>
 </div>
+<div id="quicklook-results" class="section level1">
+<h1>Quicklook results</h1>
+</div>
 <div id="import-and-inspect" class="section level1">
 <h1>Import and inspect</h1>
 <p>The first step is importing the data</p>
@@ -1532,6 +1535,8 @@ p_load(readr, janitor, here)
 p_load(magrittr, dplyr, tidyr, lubridate, stringr, broom)
 p_load(ggplot2, scales)
 p_load(knitr, kableExtra, skimr, pander)
+p_load(rstan, brms, tidybayes)
+p_load(parallel, future)
 
 if(!file.exists('.here')) {
   set_here(path = getwd())
@@ -1541,7 +1546,10 @@ if(!file.exists('.here')) {
 skim_with_defaults()
 
 # plotting constants
-theme_set(theme_bw())</code></pre>
+theme_set(theme_bw())
+
+# parallel processing w/ future
+future::plan(multiprocess)</code></pre>
 <pre class="r"><code>user_info &lt;- read_csv(here::here('user_table.csv')) %&gt;% clean_names(.)
 test_results &lt;- read.csv(here::here('test_results.csv')) %&gt;%
   as_tibble(.) %&gt;%
@@ -1967,49 +1975,56 @@ Total
 </table>
 <pre class="r"><code>conversion_table %&gt;%
   chisq.test() %&gt;%
-  tidy() %&gt;%
-  knitr::kable() %&gt;%
-  kableExtra::kable_styling()</code></pre>
-<table class="table" style="margin-left: auto; margin-right: auto;">
-<thead>
-<tr>
-<th style="text-align:right;">
-statistic
-</th>
-<th style="text-align:right;">
-p.value
-</th>
-<th style="text-align:right;">
-parameter
-</th>
-<th style="text-align:left;">
-method
-</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align:right;">
-76.89494
-</td>
-<td style="text-align:right;">
-0
-</td>
-<td style="text-align:right;">
-1
-</td>
-<td style="text-align:left;">
-Pearson’s Chi-squared test with Yates’ continuity correction
-</td>
-</tr>
-</tbody>
-</table>
+  tidy()</code></pre>
+<pre><code>## # A tibble: 1 x 4
+##   statistic  p.value parameter method                                                      
+##       &lt;dbl&gt;    &lt;dbl&gt;     &lt;int&gt; &lt;chr&gt;                                                       
+## 1      76.9 1.80e-18         1 Pearson's Chi-squared test with Yates' continuity correction</code></pre>
 <p>A <span class="math inline">\(\chi^{2}\)</span> test (displayed) might be the appropriate here: we are testing to see if there is a significant difference between the expected frequencies and the observed frequencies in the two-way table. Given this, we might say that the test group is converting at a lower rate than the control group. However, this test doesn’t deal with differences in revenue created by the new group or if there is an increase or decrease in conversion based on the testing group.</p>
-<p>However, these results do indicate that there is a significant difference between the test and control groups. Based on the populations of the two-way table,</p>
+<p>Regardless, the results of the <span class="math inline">\(\chi^{2}\)</span> test indicate that there is a significant difference between the test and control groups. Based on the distribution of counts in the two-way table, a smaller percentage of the test group is converting than the control group.</p>
+<p>But is that meaningful for our question? What about revenue? What about different segments of the user base? Currently, I’ve only considered the user base as a whole.</p>
 </div>
-<div id="revenue-comparison" class="section level2">
-<h2>Revenue comparison</h2>
+<div id="by-segment" class="section level2">
+<h2>By segment</h2>
+<p>Let’s see if there is a particular demographic that is most affected by the A/B test. For example, do mobile users convert at a greater rate than web users?</p>
+<p>I’m going to use logistic regression with a series of categorical predictors. In particular, I’m using Bayesian logistic regression to so I can use weakly informative to lightly regularize the regression coefficient estimates. Additionally, by using <code>brms</code> I can extract the underlying Stan code, which can be compiled into a C++ module or even used in other programming languages like python. This means my exploration can lead directly to production.</p>
+<p>With unbalanced classes, logistic regression can have trouble as the intercept goes to far negative or positive. However, these classes are not severely unbalanced, so I’m going to start this analysis without any special handling of unbalanced classes.</p>
+<p>With any Bayesian model, there are always questions surrounding choice of prior. I’m opting for weakly informative priors that are informed by the properties of the logistic function. Coefficients with magnitude greater than 2 are unlikely, and an intercept with magnitude greater than 5 are extremely unlikely. However, I’m going to use a slighly weaker prior for the intercept because it can be hard to predict its behaviour in the presence of predictors. Additionally, by lightly concentrating the density of the prior around 0, high magnitude posterior estimates will be slightly shrunk towards 0. I do not have any more domain knowledge about the problem, so I’m sticking with these rather general priors.</p>
+<p>I do not need to explicitly dummy code out the categorical variables as R and <code>brms</code> take care of that under the hood.</p>
+<pre class="r"><code>model_1 &lt;- 
+  test_results %&gt;%
+  brm(data = .,
+      family = bernoulli(),
+      formula = bf(converted ~ test + device),
+      prior = c(prior(normal(0, 5), class = 'Intercept'),
+                prior(normal(0, 1), class = 'b')),
+      iter = 2000,
+      warmup = 1000,
+      chains = 4,
+      refresh = 0,
+      future = TRUE)                   # parallel processing via future</code></pre>
+<pre class="r"><code>summary(model_1)</code></pre>
+<pre><code>##  Family: bernoulli 
+##   Links: mu = logit 
+## Formula: converted ~ test + device 
+##    Data: . (Number of observations: 316800) 
+## Samples: 4 chains, each with iter = 2000; warmup = 1000; thin = 1;
+##          total post-warmup samples = 4000
+## 
+## Population-Level Effects: 
+##           Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+## Intercept    -3.89      0.02    -3.92    -3.85 1.00     4492     3144
+## test         -0.25      0.03    -0.31    -0.20 1.00     4000     3093
+## deviceweb    -0.03      0.03    -0.08     0.03 1.00     3476     2871
+## 
+## Samples were drawn using sampling(NUTS). For each parameter, Eff.Sample 
+## is a crude measure of effective sample size, and Rhat is the potential 
+## scale reduction factor on split chains (at convergence, Rhat = 1).</code></pre>
+<p>I could imagine also using some kind of log-linear model, but that just feels like a special case of logistic regression without all the nice properties afforded by the Bayesian approach.</p>
 </div>
+</div>
+<div id="conversions-over-time" class="section level1">
+<h1>Conversions over time</h1>
 </div>
 
 
