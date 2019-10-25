@@ -16,6 +16,12 @@ The goal here is to evaluate whether a pricing test running on the site has been
 
 # Quicklook results
 
+- Fewer users convert when presented with the higher price.
+- However, the test group has greater average revenue per person than the control group.
+- Looking deeper at conversion rate
+  - direct referal is a positive indicator of conversion rate
+  - users directed by ads have a greater conversion rate than people directly accessing the site or led there by search engine optimzation
+  - there is no difference in conversion rate between mobile and web users
 
 
 
@@ -31,10 +37,10 @@ if(!('pacman' %in% rownames(installed.packages()))) {
 library(pacman)
 
 p_load(readr, janitor, here)
-p_load(magrittr, dplyr, tidyr, lubridate, stringr, broom)
+p_load(magrittr, dplyr, tidyr, lubridate, stringr, broom, purrr, forcats)
 p_load(ggplot2, scales)
 p_load(knitr, kableExtra, skimr, pander)
-p_load(rstan, brms, tidybayes)
+p_load(rsample, arm, rstan, brms, tidybayes)
 p_load(parallel, future)
 
 if(!file.exists('.here')) {
@@ -166,15 +172,67 @@ Regardless, the results of the $\chi^{2}$ test indicate that there is a signific
 But is that meaningful for our question? What about revenue? What about different segments of the user base? Currently, I've only considered the user base as a whole.
 
 
+## Revenue differential
 
-## By segment
+Ok, so the test group converts less often. But is the company earning more money, on average, from the testing group than the control group?
+
+```{r revenue}
+test_results  %>%
+  group_by(test) %>%
+  mutate(paid = price * converted) %>%
+  summarize(earn = sum(paid),
+            earn_avg = earn / n())
+```
+
+This simple summary implies that average earning per test user is slightly higher than that earned from the control group. However, these individual values aren't very useful -- how do we know if this difference between the groups is real?
+
+One approach is to use bootstrap resampling to give confidence intervals on these estimates.
+
+```{r revenue_bootstrap}
+
+get_earn_avg <- function(split) {
+  as.data.frame(split) %>%
+    group_by(test) %>%
+    mutate(paid = price * converted) %>%
+    summarize(earn_avg = sum(paid) / n())
+}
+
+boot_res <- 
+  test_results %>%
+  bootstraps(., times = 100, strata = test) %>%
+  transmute(sum_stat = purrr::map(splits, get_earn_avg)) %>%
+  unnest(cols = c(sum_stat))
+
+boot_res %>%
+  mutate(test_name = case_when(test == 0 ~ 'Control',
+                               test == 1 ~ 'Test')) %>%
+  ggplot(aes(x = earn_avg, 
+             group = test_name, 
+             colour = test_name,
+             fill = test_name)) +
+  geom_density() +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+  scale_colour_manual(values = c("#E69F00", "#56B4E9")) +
+  labs(x = 'Average earnings per user',
+       y = 'Density',
+       labs = 'Bootstrap estimates of Average earnings per user, by test group',
+       colour = 'Experimental\ngroup',
+       fill = 'Experimental\ngroup')
+```
+
+Given the lack of overlap between these two distributions, I conclude that even though the test group coverts less often than the control group, the average earnings per user is greater.
+
+
+
+
+# Conversion by segment
 
 Let's see if there is a particular demographic that is most affected by the A/B test. For example, do mobile users convert at a greater rate than web users? I'm going to use device and source as additional predictors. 
 
 Before I can use source as a predictor, I'm going to simplify the space a little -- I'm just going to compare e.g. ads versus seo and assume that the type of source is mostly noise.
 
 ```{r feature_source}
-test_results %>%
+test_results %<>%
   mutate(source = str_replace(source, '-', '_'),
          source_simple = str_extract(source, pattern = '^[^_]+(?=_)'))
 ```
@@ -182,15 +240,27 @@ test_results %>%
 
 I'm going to model this data using logistic regression with a series of categorical predictors. In particular, I'm using Bayesian logistic regression to so I can use weakly informative to lightly regularize the regression coefficient estimates. Additionally, by using `brms` I can extract the underlying Stan code, which can be compiled into a C++ module or even used in other programming languages like python. This means my exploration can lead directly to production.
 
-With unbalanced classes, logistic regression can have trouble as the intercept goes to far negative or positive. However, these classes are not severely unbalanced, so I'm going to start this analysis without any special handling of unbalanced classes.
 
 With any Bayesian model, there are always questions surrounding choice of prior. I'm opting for weakly informative priors that are informed by the properties of the logistic function. Coefficients with magnitude greater than 2 are unlikely, and an intercept with magnitude greater than 5 are extremely unlikely. However, I'm going to use a slighly weaker prior for the intercept because it can be hard to predict its behaviour in the presence of predictors. Additionally, by lightly concentrating the density of the prior around 0, high magnitude posterior estimates will be slightly shrunk towards 0. I do not have any more domain knowledge about the problem, so I'm sticking with these rather general priors.
 
 I do not need to explicitly dummy code out the categorical variables as R and `brms` take care of that under the hood.
 
+Also, before I fit the model, I should probably split the data into test and training sets.
+
+```{r train_test}
+results_split <- 
+  test_results %>%
+  initial_split(prop = 0.8, strata = converted)
+
+results_train <- training(results_split)
+results_test <- testing(results_split)
+```
+
+Now to fit a model.
+
 ```{r conversion_model, cache = TRUE, message = FALSE}
 model_1 <- 
-  test_results %>%
+  results_train %>%
   brm(data = .,
       family = bernoulli(),
       formula = bf(converted ~ test + device + source_simple),
@@ -204,18 +274,37 @@ model_1 <-
 ```
 ```{r conversion_model_summary}
 summary(model_1)
+
+model_1 %>%
+  tidy_draws() %>%
+  dplyr::select(-(.chain:.draw), -(lp__:energy__)) %>%
+  gather(key = key, value = value) %>%
+  mutate(key = fct_inorder(key),
+         key = fct_rev(key)) %>%
+  ggplot(aes(x = value, y = key)) +
+  geom_halfeyeh(.width = c(0.9, 0.5)) +
+  labs(x = 'Posterior estimate',
+       y = 'Regression coefficient',
+       title = 'Parameter estimates for basic conversion model')
 ```
+
+Our intercept is a very negative number on the logit scale. Interpreted as a probability, the median posterior probability of a user converting when that user is in the control group, on a mobile device and directed to the site via an add is 0.02. With unbalanced classes, logistic regression can have trouble predicting the state of new observations because the intercept term is too negative or positive. 
+
+If this is an issue, it will be revealed when inspecting how well this model can predict on the testing data.
 
 As we learned earlier, the test group has a lower probability of converting than the control group. My guess is that the increased price turns people off.
 
 Additionally, the device has no effect on conversion probability.
 
+Interestingly, relative to ads, a user coming to the site via a friend's recomendation is the greatest predictor of a user actually converting. In contrast, direct traffic or search engine optimzation appears to decrease probability of converting relative to being directed via an ad.
+
+## Posterior predictive analysis
+
+## Test data
+
+
 
 All of this, however, still hasn't answered the question of how **revenue** may have changed in the test group versus the control.
-
-
-
-I could imagine also using some kind of log-linear model, but that just feels like a special case of logistic regression without all the nice properties afforded by the Bayesian approach.
 
 
 # Conversions over time
