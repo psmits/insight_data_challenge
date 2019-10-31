@@ -1,0 +1,315 @@
+---
+title: 'Costly conversion data challenge'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+```{r set-options, echo=FALSE, cache=FALSE}
+library(knitr)
+options(width = 120)
+knitr::opts_chunk$set(fig.width=10, fig.height=8) 
+```
+
+# Setup
+
+Given video game sales data from last 30 years
+
+- What are some of the major differences between North American, European, and Japanese video game markets
+- What video game genres are trending in each market?
+- What features about video games are most indicative of its success?
+
+
+# Quicklook results
+
+- Overall, North America and Europe is a larger market for Action, Shooting, and Sports games than Japan.
+- Overall, Japan is a larger market for Role Playing games than North America or Europe.
+- Action and Shooting games have grown the most in the short amount of time. In contrast, Fighting and Strategy games have leveled off.
+
+
+
+
+# Import and inspect
+
+The first step is importing various packages and the data itself
+
+```{r import_package, results = 'hide', message = FALSE}
+if(!('pacman' %in% rownames(installed.packages()))) {
+  install.packages('pacman')
+}
+library(pacman)
+
+p_load(readr, readxl, janitor, here)
+p_load(magrittr, dplyr, tidyr)
+p_load(ggplot2, scales, viridis, ggrepel)
+p_load(kableExtra, skimr, pander)
+
+if(!file.exists('.here')) {
+  set_here(path = getwd())
+}
+
+# summary constants
+skim_with_defaults()
+
+# plotting constants
+theme_set(theme_bw(base_size = 15))
+```
+
+```{r import_data, results = 'asis'}
+vg_sales <- read_xlsx(here::here('vgsales.xlsx'),
+                      na = c('', 'N/A')) %>% 
+  clean_names()
+
+skim(vg_sales) %>% pander()
+```
+
+There are some NAs in the year column.
+
+```{r explore_na}
+vg_sales %>%
+  filter(is.na(year)) %>%
+  skim %>%
+  pander()
+```
+
+Also, year seems to have a weird shape to it. How many observations are there per year?
+
+
+
+
+# Exploratory graphs
+
+
+## Sales by region
+
+First I'm going to visualize relative sales for the past 30 years for each region by genre. 
+
+```{r region_genre}
+sales_region_genre <- 
+  vg_sales %>%
+  dplyr::select(genre, na_sales, eu_sales, jp_sales) %>%
+  pivot_longer(-genre, names_to = 'region', values_to = 'sales') %>%
+  group_by(genre, region) %>%
+  dplyr::summarize(sales = sum(sales)) %>%
+  mutate(region_full = case_when(region == 'eu_sales' ~ 'Europe',
+                                 region == 'jp_sales' ~ 'Japan',
+                                 region == 'na_sales' ~ 'North America'))
+
+sales_region_genre %>%
+  ggplot(aes(x = region_full, 
+             y = sales, 
+             fill = genre, 
+             label = genre)) +
+  geom_col(position = 'fill') +
+  geom_text(position = 'fill',
+            colour = 'gray70') +
+  scale_fill_viridis(discrete = TRUE, option = 'magma') +
+  theme(legend.position = 'none') +
+  labs(x = 'Region',
+       y = 'Relative sales (30 year total)',
+       title = 'Relative sales of game genres by region for 30 years')
+```
+
+## Sales over time
+
+I want to start exploring sales over time. There are a lot of ways to break down sales over time: by region, by genre, and by region and genre.
+
+I'm going to iterate through those different views in order to get a fuller understanding of sales.
+
+An initial hurdle to some visualization approaches is that there are many year, region, and genre combinations where there are no sales recoded. I'm going to fill those empty values with 0s to improve plotting. These NAs are probably created by no sales of that genre in any region that year; sales only in regions outside of Europe, Japan, or North America; or no games of that genre for sale that year.
+
+```{r prep_data}
+#' Fill in empty sales data for unobserved combinations
+#'
+#' @param data tibble or dataframe with 4 columns: year, region, genre, and sales
+#' @return a tibble
+fill_empty <- function(data) {
+  years <- expand.grid(year = unique(data$year),
+                       region = unique(data$region),
+                       genre = unique(data$genre)) %>%
+  as_tibble() %>%
+  mutate(year = as.numeric(year),
+         region = as.character(region),
+         genre = as.character(genre))
+
+  out <- 
+    years %>%
+    left_join(data,
+              by = c('year','region', 'genre')) %>%
+    mutate(sales = if_else(is.na(sales), 0, sales))
+  
+  out
+}
+
+# sales data over time
+sales_time <- 
+  vg_sales %>%
+  drop_na() %>%
+  dplyr::select(year, genre, na_sales, eu_sales, jp_sales) %>%
+  pivot_longer(-c(year, genre), 
+               names_to = 'region', 
+               values_to = 'sales') %>%
+  fill_empty(data = .)
+```
+
+Now that there is a sales value for every year-region-genre combo, I'm going to make some graphs.
+
+First, let's observe regional sales over time, both cumulative and per year. 
+
+Because I'm going to be doing a similar operation but using genre next, I'm going to write the summary procedure as a function. I use tidy evaluation to improve the portability of the function.
+
+I also have a small function for generating line labels that can be placed at the end of a time series. I'm conflicted on whether to use them in this presentation, but I'd rather have the option than not. Especially given that I've written it right now, I could use it in future iterations.
+
+
+```{r functions_necessary}
+#' Repeat operation to group sales data and calculate useful information.
+#'
+#' Uses tidy evaluation
+#'
+#' @param data tibble or data.frame
+#' @group_var grouping variable
+#' @time_var time variable
+#' @value_var value to operate on
+#' @names_to character name for summary names
+#' @group_var character name of summary values
+#' @return a tibble object
+prep_oneway <- function(data, group_var, time_var, value_var, names_to, values_to) {
+  group_var = enquo(group_var)
+  time_var = enquo(time_var)
+  value_var = enquo(value_var)
+  
+  data %>%
+    group_by(!!group_var, !!time_var) %>%
+    arrange(year) %>%
+    summarize(value = sum(!!value_var)) %>%
+    mutate(value_cum = cumsum(value)) %>%
+    pivot_longer(-c(!!group_var, !!time_var), 
+                 names_to = names_to,
+                 values_to = values_to)
+}
+
+#' Generate quick and dirty labels for time series ends
+#'
+#' @param max_var numeric vector where max_var is most recent time value (ascending)
+#' @param label_var character vector what string to display at end of series
+#' @return boolean vector
+label_series <- function(max_var, label_var) {
+  if_else(max_var == max(max_var, na.rm = TRUE),
+          label_var,
+          NA_character_)
+}
+
+```
+
+
+Given these functions, let's create a plot of sales over time. This is mostly label cleaning and plotting details.
+
+```{r time_region}
+sales_time_region <- 
+  sales_time %>%
+  prep_oneway(group_var = region,
+              time_var = year,
+              value_var = sales,
+              names_to = 'sales_type',
+              values_to = 'value') %>%
+  mutate(region_full = case_when(region == 'eu_sales' ~ 'Europe',
+                                 region == 'jp_sales' ~ 'Japan',
+                                 region == 'na_sales' ~ 'North America'),
+         sales_type_full = 
+           case_when(sales_type == 'value' ~ 'Yearly sales',
+                     sales_type == 'value_cum' ~ 'Cumulative sales'))
+
+
+sales_time_region %>%
+  mutate(label = label_series(max_var = year, label_var = region)) %>%
+  ggplot(aes(x = year, y = value, color = region_full)) +
+  geom_line(size = 1.25) +
+  facet_grid(sales_type_full ~ ., 
+             scales = 'free_y',
+             switch = 'y') +
+  geom_label_repel(aes(label = label),
+                   nudge_x = 0.5,
+                   na.rm = TRUE,
+                   segment.size = 0.5) +
+  expand_limits(x = 2025) +
+  scale_color_viridis(discrete = TRUE) +
+  theme(legend.position = 'none') +
+  labs(x = 'Time',
+       y = 'Sales',
+       title = 'Yearly and cumulative sales by region')
+```
+
+
+Genre over time
+
+```{r time_genre}
+sales_time_genre <- 
+  sales_time %>%
+  prep_oneway(group_var = genre,
+              time_var = year,
+              value_var = sales,
+              names_to = 'sales_type',
+              values_to = 'value') %>%
+  mutate(sales_type_full = 
+         case_when(sales_type == 'value' ~ 'Yearly sales',
+                   sales_type == 'value_cum' ~ 'Cumulative sales'))
+
+sales_time_genre %>%
+  #mutate(label = label_series(max_var = year, label_var = genre)) %>%
+  ggplot(aes(x = year, y = value, colour = genre)) +
+  geom_line(size = 1.25) +
+  facet_grid(sales_type_full ~ .,
+             scales = 'free_y',
+             switch = 'y') +
+  #geom_label_repel(aes(label = label),
+  #                 nudge_x = 0.5,
+  #                 na.rm = TRUE,
+  #                 segment.size = 0.5) +
+  #expand_limits(x = 2025) +
+  scale_color_viridis(discrete = TRUE) +
+  #theme(legend.position = 'none') +
+  labs(x = 'Time',
+       y = 'Sales',
+       title = 'Yearly and cumulative sales by genre')
+
+```
+
+
+
+
+
+
+
+Region and genre over time.
+
+```{r time_region_genre}
+sales_time_region_genre <- 
+  sales_time %>%
+  group_by(region, year, genre) %>%
+  arrange(year) %>%
+  summarize(sales = sum(sales)) %>%
+  mutate(sales_cum = cumsum(sales)) %>%
+  pivot_longer(-c(region, year, genre),
+               names_to = 'sales_type',
+               values_to = 'value') %>%
+  mutate(region_full = case_when(region == 'eu_sales' ~ 'Europe',
+                                 region == 'jp_sales' ~ 'Japan',
+                                 region == 'na_sales' ~ 'North America'),
+         sales_type_full = 
+           case_when(sales_type == 'sales' ~ 'Yearly sales',
+                     sales_type == 'sales_cum' ~ 'Cumulative sales'))
+
+sales_time_region_genre %>%
+  #mutate(label = if_else(year == max(year, na.rm = TRUE),
+  #                       region_full,
+  #                       NA_character_)) %>%
+  ggplot(aes(x = year, y = value, 
+             color = genre, fill = genre)) +
+  geom_area() +
+  geom_line(size = 1.25, position = 'stack') +
+  facet_grid(sales_type_full ~ region_full,
+             scales = 'free_y') +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_colour_viridis(discrete = TRUE)
+
+```
